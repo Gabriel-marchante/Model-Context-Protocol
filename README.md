@@ -216,9 +216,11 @@ Más info: [modelcontextprotocol.io](https://modelcontextprotocol.io)
 
 ---
 
-## 👨‍💻 Autor
+## ✍️ Créditos
 
-**Gabriel Marchante Bañuls**
+Desarrollado por **Macloud Team (Gabriel Marchante)**. Inspirado en herramientas de seguridad clásicas y estética retro-futurista.
+
+---
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-blue?logo=linkedin)](https://linkedin.com/in/gabriel-marchante) [![GitHub](https://img.shields.io/badge/GitHub-black?logo=github)](https://github.com/Gabriel-marchante)
 
