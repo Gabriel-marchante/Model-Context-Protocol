@@ -1,0 +1,18 @@
+﻿# Generated / runtime
+mcp-agent/control-plane/generated/
+mcps/**/generated/
+**/generated/
+
+# Logs
+*.log
+
+# Node
+node_modules/
+
+# Java / Maven
+target/
+*.class
+
+# OS
+.DS_Store
+Thumbs.db

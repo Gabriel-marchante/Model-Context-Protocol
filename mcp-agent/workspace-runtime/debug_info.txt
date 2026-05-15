@@ -1,0 +1,4 @@
+Nombre: myAvatar (1).png
+Mime: image/png
+Longitud: 170088
+Inicio: iVBORw0KGgoAAAANSUhE
