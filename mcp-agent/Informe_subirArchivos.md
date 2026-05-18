@@ -1,92 +1,85 @@
-# Informe Técnico de Subida de Archivos e Imágenes
+# Informe Técnico: Implementación Multimodal en Agentes IA
 
-Este documento detalla la arquitectura de **lectura multiformato** que permite al agente procesar archivos de texto, código, imágenes y audio de manera fluida, utilizando una **llamada HTTP directa** a la API de Google Gemini.
-
-> [!IMPORTANT]
-> Esta arquitectura fue rediseñada para superar una limitación crítica del proxy `@RegisterAiService` de Quarkus LangChain4j, que convertía los datos binarios multimodales (imágenes, audio) a texto plano mediante `.toString()`, impidiendo la visión nativa del modelo.
+**Guía completa para implementar subida y procesamiento de archivos (imágenes, audio, PDFs y texto) en cualquier agente basado en la API de Google Gemini.**
 
 ---
 
-## 1. 📂 Flujo Completo de Información
-
-### Esquema Conceptual
-![Diagrama de Flujo Conceptual](./assets/flujo_conceptual.png)
-
-> [!NOTE]
-> El sistema utiliza una arquitectura de **llamada HTTP directa** a la API de Gemini. Cada archivo adjunto se transforma en un bloque `inlineData` con su MIME type y datos Base64, garantizando que los bytes lleguen intactos al modelo.
-
-### Diagrama de Secuencia (Arquitectura Real)
+## 1. Flujo Completo de Información
 
 ```mermaid
 sequenceDiagram
-    participant U as 🖥️ Cliente (Chat UI)
-    participant Q as ⚙️ Quarkus (ChatResource)
-    participant G as 🧠 Google Gemini API
+    participant U as Cliente Chat UI
+    participant F as Frontend JS
+    participant B as Backend Java/Quarkus
+    participant G as Google Gemini API
 
-    U->>Q: POST /api/chat (JSON con adjuntos Base64)
-    Q->>Q: Clasificar adjuntos (imagen/audio/texto)
-    Q->>Q: Construir JSON con inlineData nativo
-    Q->>G: POST generateContent (HTTP directo)
-    G-->>Q: Respuesta JSON con análisis real
-    Q-->>U: { "reply": "La palabra es ALONE" }
+    U->>F: Selecciona archivo + escribe mensaje
+    F->>F: Clasificar tipo de archivo
+    F->>F: readAsDataURL() para binarios / readAsText() para texto
+    F->>B: POST /api/chat con JSON attachments
+    B->>B: Detectar tipo via startsWith del Data URL
+    B->>B: Construir parts con inlineData o text
+    B->>G: POST generateContent con header x-goog-api-key
+    G-->>B: JSON con candidates[0].content.parts[].text
+    B-->>F: reply con la respuesta
+    F-->>U: Muestra respuesta en el chat
 ```
 
 ---
 
-## 2. 📨 Estructura de Mensajes (JSON)
+## 2. Flujo Detallado por Tipo de Archivo
 
-### De Cliente a Agente
-El cliente envía un objeto JSON donde los archivos vienen codificados como **Data URLs** (Base64).
+### 2.1 IMAGEN (JPEG, PNG, WebP, GIF, BMP, TIFF)
 
-**Ejemplo con imagen:**
+#### Paso 1 — Frontend: convertir a Data URL
+```javascript
+const reader = new FileReader();
+reader.onload = () => {
+    // reader.result = "data:image/jpeg;base64,/9j/4AAQSkZJRg..."
+    enviar({ fileName: file.name, fileContent: reader.result });
+};
+reader.readAsDataURL(file); // Siempre readAsDataURL para binarios
+```
+
+#### Paso 2 — JSON enviado al backend
 ```json
 {
-  "conversationId": "sesion-001",
-  "message": "¿Qué palabra aparece en la imagen?",
-  "attachments": [
-    {
-      "fileName": "foto.jpg",
-      "fileContent": "data:image/jpeg;base64,/9j/4AAQSkZJRg..."
-    }
-  ]
+  "message": "Que palabra aparece en la imagen?",
+  "attachments": [{
+    "fileName": "foto.jpg",
+    "fileContent": "data:image/jpeg;base64,/9j/4AAQSkZJRg..."
+  }]
 }
 ```
 
-**Ejemplo con audio:**
-```json
-{
-  "conversationId": "sesion-001",
-  "message": "¿Qué se dice en este audio?",
-  "attachments": [
-    {
-      "fileName": "grabacion.mp3",
-      "fileContent": "data:audio/mpeg;base64,SUQzBAAAAAAAI1RT..."
-    }
-  ]
+#### Paso 3 — Backend: extraer MIME y Base64
+```java
+if (content.startsWith("data:image/")) {
+    // content = "data:image/jpeg;base64,/9j/4AAQ..."
+    //                 ^^^^^^^^^^          ^^^^^^^^^^
+    //                 MIME type           datos Base64
+
+    // Extraer MIME: desde posicion 5 ("data:" tiene 5 chars) hasta el ";"
+    String mimeType = content.substring(content.indexOf("data:") + 5, content.indexOf(";"));
+    // mimeType = "image/jpeg"
+
+    // Extraer Base64: todo despues de la coma, sin espacios
+    String base64Data = content.substring(content.indexOf(",") + 1).replaceAll("\\s", "");
+    // base64Data = "/9j/4AAQSkZJRg..."
+
+    // Construir bloque inlineData
+    Map<String, Object> inlineData = new LinkedHashMap<>();
+    inlineData.put("mimeType", mimeType);
+    inlineData.put("data", base64Data);
+    userParts.add(Map.of("inlineData", inlineData));
 }
 ```
 
-**Ejemplo mixto (imagen + audio + texto):**
-```json
-{
-  "conversationId": "sesion-001",
-  "message": "Analiza todos estos archivos",
-  "attachments": [
-    { "fileName": "captura.png", "fileContent": "data:image/png;base64,iVBOR..." },
-    { "fileName": "nota_voz.mp3", "fileContent": "data:audio/mpeg;base64,SUQz..." },
-    { "fileName": "config.json", "fileContent": "{ \"debug\": true }" }
-  ]
-}
-```
-
-
-### Del Agente a la API de Gemini
-El servidor transforma cada adjunto en el formato nativo de Gemini (`inlineData`):
-
+#### Paso 4 — JSON que se envia a Gemini
 ```json
 {
   "systemInstruction": {
-    "parts": [{ "text": "Eres Claudio, un asistente con visión..." }]
+    "parts": [{ "text": "Eres un asistente con vision nativa..." }]
   },
   "contents": [{
     "role": "user",
@@ -97,45 +90,176 @@ El servidor transforma cada adjunto en el formato nativo de Gemini (`inlineData`
           "data": "/9j/4AAQSkZJRg..."
         }
       },
-      { "text": "¿Qué palabra aparece en la imagen?" }
+      { "text": "Que palabra aparece en la imagen?" }
     ]
   }],
   "generationConfig": { "maxOutputTokens": 8192 }
 }
 ```
 
-> [!TIP]
-> La clave es el bloque `inlineData`. A diferencia del proxy de LangChain4j (que convertía la imagen a texto), esta estructura envía los **bytes reales** al modelo, habilitando la visión nativa.
+El bloque `inlineData` es la clave. Envia los bytes reales al modelo. El campo `mimeType` le dice a Gemini como interpretar esos bytes.
+
+#### Paso 5 — Envio HTTP a Gemini
+```java
+String url = "https://generativelanguage.googleapis.com/v1beta/models/"
+           + modelId + ":generateContent";
+
+HttpRequest request = HttpRequest.newBuilder()
+    .uri(URI.create(url))
+    .header("Content-Type", "application/json")
+    .header("x-goog-api-key", apiKey)  // API key por header, NO en URL
+    .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+    .build();
+```
+
+La autenticacion se hace mediante el header `x-goog-api-key`. Esto evita que la clave quede registrada en logs de servidor, proxies o trazas de red. Google tambien soporta `?key=` en la URL pero el header es mas seguro.
+
+#### Paso 6 — Parsear respuesta con null-safety
+```java
+// Comprobar bloqueo por seguridad
+List<Map<String, Object>> candidates = (List) responseBody.get("candidates");
+if (candidates == null || candidates.isEmpty()) {
+    // Gemini bloqueo la respuesta (contenido inapropiado, etc.)
+    Map<String, Object> feedback = (Map) responseBody.get("promptFeedback");
+    String reason = feedback != null ? String.valueOf(feedback.get("blockReason")) : "desconocida";
+    return Map.of("error", "Bloqueado por seguridad. Razon: " + reason);
+}
+
+Map<String, Object> candidateContent = (Map) candidates.get(0).get("content");
+if (candidateContent == null) {
+    // finishReason puede ser SAFETY, RECITATION, etc.
+    return Map.of("error", "Sin contenido. finishReason: " + candidates.get(0).get("finishReason"));
+}
+
+// Buscar la PRIMERA part con texto (no asumir que es la ultima)
+List<Map<String, Object>> parts = (List) candidateContent.get("parts");
+for (Map<String, Object> part : parts) {
+    String text = (String) part.get("text");
+    if (text != null && !text.isBlank()) {
+        return Map.of("reply", text);
+    }
+}
+```
 
 ---
 
-## 3. 🗂️ Tipos de Archivos Soportados
+### 2.2 AUDIO (MP3, WAV, OGG, FLAC, AAC, WebM, M4A)
 
-| Tipo | MIME Types | Tratamiento en el Servidor | Capacidad del Modelo |
-|:---|:---|:---|:---|
-| **Imágenes** | `image/jpeg`, `image/png`, `image/webp`, `image/gif` | → `inlineData` (Base64 binario) | 👁️ Visión nativa |
-| **Audio** | `audio/mpeg`, `audio/wav`, `audio/ogg`, `audio/webm` | → `inlineData` (Base64 binario) | 👂 Escucha nativa |
-| **Texto/Código** | `text/*`, `application/json`, etc. | → `text` (contenido plano) | 📝 Análisis textual |
+El flujo es identico al de imagenes. La unica diferencia es el prefijo del Data URL.
 
-### Clasificación Automática
-El servidor detecta el tipo de archivo analizando el prefijo del Data URL:
-
+#### Frontend
+```javascript
+reader.readAsDataURL(audioFile);
+// Resultado: "data:audio/mpeg;base64,SUQzBAAAAAAAI1RT..."
 ```
-data:image/jpeg;base64,... → Imagen  → inlineData
-data:audio/mpeg;base64,... → Audio   → inlineData
-data:text/plain;base64,... → Texto   → text (decodificado)
+
+#### Backend
+```java
+else if (content.startsWith("data:audio/")) {
+    // Exactamente igual que imagen: extraer MIME + Base64 → inlineData
+    userParts.add(buildInlineData(content));
+}
+```
+
+#### JSON para Gemini
+```json
+{ "inlineData": { "mimeType": "audio/mpeg", "data": "SUQzBAAA..." } }
 ```
 
 ---
 
-## 4. ⚙️ Implementación del Servidor (Java / Quarkus)
+### 2.3 PDF / PRESENTACIONES
 
-### `ChatResource.java` — Motor de Comunicación Directa
+Mismo patron que imagen y audio. Gemini lee el PDF de forma nativa: extrae texto y analiza graficos.
 
-El servidor actúa como un **puente HTTP** entre el cliente y la API de Gemini, sin intermediarios:
+#### Frontend
+```javascript
+reader.readAsDataURL(pdfFile);
+// Resultado: "data:application/pdf;base64,JVBERi0xLjQK..."
+```
+
+#### Backend
+```java
+else if (content.startsWith("data:application/pdf")) {
+    userParts.add(buildInlineData(content));
+}
+```
+
+#### JSON para Gemini
+```json
+{ "inlineData": { "mimeType": "application/pdf", "data": "JVBERi0x..." } }
+```
+
+---
+
+### 2.4 TEXTO / CODIGO
+
+Los archivos de texto NO usan `inlineData`. Se envian como `text` plano.
+
+**Importante:** El frontend puede enviar texto de dos formas distintas:
+- `readAsText()` → llega como contenido plano (sin prefijo `data:`)
+- `readAsDataURL()` → llega como `data:text/plain;base64,eyJkZWJ1Zy...`
+
+El backend debe manejar **ambos casos**:
 
 ```java
+else if (content.startsWith("data:text/") && content.contains("base64,")) {
+    // Caso 1: texto enviado como Data URL → decodificar Base64
+    String base64Data = content.substring(content.indexOf(",") + 1);
+    String decoded = new String(
+        Base64.getDecoder().decode(base64Data),
+        StandardCharsets.UTF_8
+    );
+    userParts.add(Map.of("text", "--- ARCHIVO: " + name + " ---\n" + decoded + "\n\n"));
+}
+else if (!content.startsWith("data:")) {
+    // Caso 2: texto enviado como contenido plano (readAsText)
+    userParts.add(Map.of("text", "--- ARCHIVO: " + name + " ---\n" + content + "\n\n"));
+}
+```
+
+#### JSON para Gemini
+```json
+{ "text": "--- ARCHIVO: config.json ---\n{ \"debug\": true }\n\n" }
+```
+
+Los delimitadores `--- ARCHIVO: nombre ---` evitan que Gemini confunda el contenido del archivo con la pregunta del usuario.
+
+---
+
+## 3. Tabla de Tipos Soportados
+
+| Tipo | Formatos | MIME types | Campo JSON | Limite inline | Estado |
+|:---|:---|:---|:---|:---|:---|
+| Imagen | JPEG, PNG, WebP, GIF, BMP, TIFF | `image/*` | `inlineData` | ~15 MB por archivo (20 MB total request) | Operativo |
+| Audio | MP3, WAV, OGG, FLAC, AAC, M4A | `audio/*` | `inlineData` | ~15 MB por archivo (20 MB total request) | Operativo |
+| PDF | PDF | `application/pdf` | `inlineData` | ~15 MB / ~1000 paginas | Operativo |
+| Texto | TXT, JS, PY, JSON, XML, CSV, HTML | `text/*` | `text` | ~1M tokens de contexto | Operativo |
+| Video | MP4, MOV, WebM | `video/*` | `fileData` | 2 GB (requiere Files API) | Requiere Files API |
+
+> **Nota sobre el limite de 20 MB:** Es el limite del request HTTP completo (todos los adjuntos sumados). La codificacion Base64 infla el tamano un ~33%, por lo que un archivo de ~15 MB en disco genera ~20 MB de Base64.
+
+---
+
+## 4. Codigo Completo Funcional
+
+```java
+package org.acme.runtime;
+
+import jakarta.inject.Inject;
+import jakarta.ws.rs.*;
+import jakarta.ws.rs.core.MediaType;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.util.*;
+
 @Path("/api/chat")
+@Consumes(MediaType.APPLICATION_JSON)
+@Produces(MediaType.APPLICATION_JSON)
 public class ChatResource {
 
     @ConfigProperty(name = "quarkus.langchain4j.ai.gemini.api-key")
@@ -147,112 +271,245 @@ public class ChatResource {
 
     private static final HttpClient httpClient = HttpClient.newHttpClient();
 
+    @Inject
+    ObjectMapper objectMapper;
+
     @POST
+    @SuppressWarnings("unchecked")
     public Map<String, Object> chat(Map<String, Object> payload) {
-        List<Map<String, Object>> userParts = new ArrayList<>();
+        String message = payload == null || payload.get("message") == null
+                ? "" : String.valueOf(payload.get("message"));
 
-        for (Map<String, String> att : attachments) {
-            String content = att.get("fileContent");
+        List<Map<String, String>> attachments = payload == null ? null
+                : (List<Map<String, String>>) payload.get("attachments");
 
-            if (content.contains("data:image/")) {
-                // IMAGEN → inlineData (visión nativa)
-                String mimeType = /* extraer MIME */;
-                String base64Data = /* extraer datos */;
-                userParts.add(Map.of("inlineData",
-                    Map.of("mimeType", mimeType, "data", base64Data)));
+        try {
+            // FASE 1: CLASIFICAR Y TRANSFORMAR ADJUNTOS
+            List<Map<String, Object>> userParts = new ArrayList<>();
+
+            if (attachments != null) {
+                for (Map<String, String> att : attachments) {
+                    String content = att.getOrDefault("fileContent", "").trim();
+                    String name = att.getOrDefault("fileName", "adjunto");
+
+                    if (content.startsWith("data:image/")) {
+                        userParts.add(buildInlineData(content));
+                    }
+                    else if (content.startsWith("data:audio/")) {
+                        userParts.add(buildInlineData(content));
+                    }
+                    else if (content.startsWith("data:application/pdf")) {
+                        userParts.add(buildInlineData(content));
+                    }
+                    else if (content.startsWith("data:text/") && content.contains("base64,")) {
+                        String base64Data = content.substring(content.indexOf(",") + 1);
+                        String decoded = new String(
+                            Base64.getDecoder().decode(base64Data),
+                            java.nio.charset.StandardCharsets.UTF_8);
+                        userParts.add(Map.of("text",
+                            "--- ARCHIVO: " + name + " ---\n" + decoded + "\n\n"));
+                    }
+                    else if (!content.startsWith("data:")) {
+                        userParts.add(Map.of("text",
+                            "--- ARCHIVO: " + name + " ---\n" + content + "\n\n"));
+                    }
+                }
             }
-            else if (content.contains("data:audio/")) {
-                // AUDIO → inlineData (escucha nativa)
-                userParts.add(Map.of("inlineData",
-                    Map.of("mimeType", mimeType, "data", base64Data)));
+
+            if (!message.isBlank()) {
+                userParts.add(Map.of("text", message));
             }
-            else {
-                // TEXTO/CÓDIGO → text
-                userParts.add(Map.of("text",
-                    "--- ARCHIVO: " + name + " ---\n" + content));
+
+            // FASE 2: CONSTRUIR JSON PARA GEMINI
+            Map<String, Object> requestBody = new LinkedHashMap<>();
+
+            requestBody.put("systemInstruction", Map.of(
+                "parts", List.of(Map.of("text",
+                    "Eres un asistente con vision y oido integrados. " +
+                    "Responde en espanol. Analiza adjuntos con detalle."))));
+
+            Map<String, Object> userContent = new LinkedHashMap<>();
+            userContent.put("role", "user");
+            userContent.put("parts", userParts);
+            requestBody.put("contents", List.of(userContent));
+            requestBody.put("generationConfig", Map.of("maxOutputTokens", 8192));
+
+            // FASE 3: ENVIAR HTTP CON API KEY EN HEADER
+            String jsonBody = objectMapper.writeValueAsString(requestBody);
+            String url = "https://generativelanguage.googleapis.com/v1beta/models/"
+                       + modelId + ":generateContent";
+
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Content-Type", "application/json")
+                .header("x-goog-api-key", apiKey)
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                .build();
+
+            HttpResponse<String> response = httpClient.send(
+                request, HttpResponse.BodyHandlers.ofString());
+
+            // FASE 4: PARSEAR CON NULL-SAFETY
+            if (response.statusCode() != 200) {
+                return Map.of("error", "HTTP " + response.statusCode()
+                    + ": " + response.body());
             }
+
+            Map<String, Object> body = objectMapper.readValue(
+                response.body(), Map.class);
+
+            List<Map<String, Object>> candidates =
+                (List) body.get("candidates");
+            if (candidates == null || candidates.isEmpty()) {
+                Map<String, Object> fb = (Map) body.get("promptFeedback");
+                String reason = fb != null
+                    ? String.valueOf(fb.get("blockReason")) : "desconocida";
+                return Map.of("error", "Bloqueado: " + reason);
+            }
+
+            Map<String, Object> cc = (Map) candidates.get(0).get("content");
+            if (cc == null) {
+                return Map.of("error", "Sin contenido: "
+                    + candidates.get(0).get("finishReason"));
+            }
+
+            List<Map<String, Object>> parts = (List) cc.get("parts");
+            if (parts != null) {
+                for (Map<String, Object> part : parts) {
+                    String text = (String) part.get("text");
+                    if (text != null && !text.isBlank())
+                        return Map.of("reply", text);
+                }
+            }
+            return Map.of("error", "Respuesta vacia de Gemini");
+
+        } catch (Exception e) {
+            return Map.of("error", "Error: " + e.getMessage());
         }
+    }
 
-        // Llamada HTTP directa a Gemini
-        String url = "https://generativelanguage.googleapis.com/v1beta/models/"
-                   + modelId + ":generateContent?key=" + apiKey;
-        // ... enviar y parsear respuesta ...
+    /** Extrae MIME y Base64 de un Data URL → bloque inlineData */
+    private Map<String, Object> buildInlineData(String dataUrl) {
+        String mimeType = dataUrl.substring(
+            dataUrl.indexOf("data:") + 5, dataUrl.indexOf(";"));
+        String base64Data = dataUrl.substring(
+            dataUrl.indexOf(",") + 1).replaceAll("\\s", "");
+        Map<String, Object> inlineData = new LinkedHashMap<>();
+        inlineData.put("mimeType", mimeType);
+        inlineData.put("data", base64Data);
+        return Map.of("inlineData", inlineData);
     }
 }
 ```
 
-> [!CAUTION]
-> **NO** se debe usar el proxy `@RegisterAiService` de Quarkus LangChain4j para contenido multimodal. El proxy convierte los objetos `UserMessage` a `.toString()`, destruyendo los datos binarios. La llamada HTTP directa es la única forma fiable de enviar imágenes y audio al modelo.
-
 ---
 
-## 5. 🏗️ Arquitectura: ¿Por qué HTTP Directo?
+## 5. La API Key: Como se Usa
 
-### El Problema del Proxy de Quarkus
+### Obtener la API Key
+1. Ir a [Google AI Studio](https://aistudio.google.com/apikey)
+2. Crear o seleccionar un proyecto
+3. Generar una API Key (empieza por `AIzaSy...`)
 
-```mermaid
-graph LR
-    subgraph "❌ Arquitectura Antigua (Proxy)"
-        A[ImageContent<br/>bytes reales] -->|.toString| B["UserMessage { contents = [ImageContent { base64 = ... }] }"]
-        B -->|Texto plano| C[Gemini recibe<br/>código Java]
-        C -->|Alucinación| D["MICROSOFT ❌"]
-    end
+### Como viaja la API Key
+Se envia como **header HTTP** (metodo seguro):
+
+```
+POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent
+Header: x-goog-api-key: AIzaSyB...dw
+Header: Content-Type: application/json
 ```
 
-```mermaid
-graph LR
-    subgraph "✅ Arquitectura Actual (HTTP Directo)"
-        E[Imagen Base64] -->|inlineData| F["{ mimeType: image/jpeg, data: /9j/... }"]
-        F -->|Bytes reales| G[Gemini ve<br/>los píxeles]
-        G -->|Análisis real| H["paper ✅"]
-    end
-```
+| Parte | Valor |
+|:---|:---|
+| Base URL | `https://generativelanguage.googleapis.com/v1beta` |
+| Modelo | `/models/gemini-2.5-flash` |
+| Accion | `:generateContent` |
+| Auth | Header `x-goog-api-key` |
 
-### Comparativa
+> Google tambien soporta `?key=` en la URL, pero el header es preferible porque la URL queda en logs de servidor y proxies.
 
-| Aspecto | Proxy `@RegisterAiService` | HTTP Directo |
-|:---|:---|:---|
-| Imágenes | ❌ Convertidas a `.toString()` | ✅ Enviadas como `inlineData` |
-| Audio | ❌ Convertido a `.toString()` | ✅ Enviado como `inlineData` |
-| Dependencias CDI | ❌ Conflictos de ClassLoader | ✅ Sin dependencias extra |
-| Control del JSON | ❌ Opaco (gestionado por proxy) | ✅ Control total |
-| Estabilidad | ❌ Errores frecuentes de arranque | ✅ Arranque fiable |
-
----
-
-## 6. 🔧 Configuración (`application.properties`)
-
+### Configuracion en el servidor
 ```properties
-# Puerto del servidor
-quarkus.http.port=${PORT:8090}
-
-# API Key de Gemini (se configura desde la interfaz)
 quarkus.langchain4j.ai.gemini.api-key=${GEMINI_API_KEY:}
-
-# Modelo a utilizar (gemini-2.5-flash soporta visión y audio)
 quarkus.langchain4j.ai.gemini.chat-model.model-id=${GEMINI_MODEL:gemini-2.5-flash}
-
-# Logs de depuración
-quarkus.langchain4j.log-requests=true
-quarkus.langchain4j.log-responses=true
-
-# Tamaño máximo de archivos adjuntos
 quarkus.http.limits.max-body-size=2000M
 ```
 
 ---
 
-## 7. 📋 Puntos Clave para la Implementación
+## 6. Guia de Implementacion en Otro Agente
 
-| Característica | Beneficio |
-|:---|:---|
-| **`inlineData`** | Los bytes de la imagen llegan intactos a Gemini, habilitando visión real |
-| **Clasificación automática** | El servidor detecta imagen/audio/texto sin intervención del usuario |
-| **`systemInstruction`** | La identidad de Claudio se envía como instrucción nativa de Gemini |
-| **Control de errores** | Los errores HTTP (503, 429) se devuelven con detalle al cliente |
-| **Sin proxy** | Elimina los conflictos de ClassLoader y la corrupción de datos |
+### Paso 1: Requisitos
+- Java 17+ (o cualquier lenguaje con HttpClient)
+- API Key de Google Gemini
+- Serializador JSON (Jackson, Gson, etc.)
+
+### Paso 2: Logica del Clasificador
+```java
+if (content.startsWith("data:image/"))             → buildInlineData()
+else if (content.startsWith("data:audio/"))         → buildInlineData()
+else if (content.startsWith("data:application/pdf"))→ buildInlineData()
+else if (content.startsWith("data:text/"))          → decodificar Base64 → text
+else if (!content.startsWith("data:"))              → text plano directo
+```
+
+Usar `startsWith` en lugar de `contains` para evitar falsos positivos.
+
+### Paso 3: Extraccion universal de MIME y Base64
+Para CUALQUIER tipo binario (imagen, audio, PDF), la operacion es siempre la misma:
+
+```java
+// Data URL: "data:image/jpeg;base64,/9j/4AAQ..."
+//                 ^^^^^^^^^^          ^^^^^^^^^^^
+//                 MIME type           datos Base64
+
+String mimeType   = dataUrl.substring(dataUrl.indexOf("data:") + 5, dataUrl.indexOf(";"));
+String base64Data = dataUrl.substring(dataUrl.indexOf(",") + 1).replaceAll("\\s", "");
+```
+
+### Paso 4: Estructura JSON para Gemini
+
+Binarios → `inlineData`:
+```json
+{ "inlineData": { "mimeType": "image/jpeg", "data": "/9j/4AAQ..." } }
+```
+
+Texto → `text`:
+```json
+{ "text": "--- ARCHIVO: app.js ---\nconsole.log('hello');\n\n" }
+```
+
+### Paso 5: Enviar y parsear
+```
+POST → generativelanguage.googleapis.com
+Header: x-goog-api-key
+Response → candidates[0].content.parts[].text (buscar primera part con texto)
+```
 
 ---
 
-> [!IMPORTANT]
-> Esta arquitectura soporta **cualquier formato** que Gemini pueda procesar: JPEG, PNG, WebP, GIF (imágenes), MP3, WAV, OGG (audio), y texto plano (código, JSON, XML, CSV, logs). El límite es el tamaño máximo de la API de Gemini (~20MB por archivo inline).
+## 7. Errores Comunes y Soluciones
+
+| Error | Causa | Solucion |
+|:---|:---|:---|
+| HTTP 503 "high demand" | Servidores de Google saturados | Reintentar en 10-30 segundos |
+| HTTP 429 "quota exceeded" | Cuota agotada | Esperar reset diario o plan de pago |
+| HTTP 400 "invalid base64" | Saltos de linea en Base64 | `.replaceAll("\\s", "")` |
+| candidates es null | Gemini bloqueo por seguridad | Leer `promptFeedback.blockReason` |
+| content es null | finishReason SAFETY o RECITATION | Leer `finishReason` del candidate |
+| Archivos texto descartados | Frontend usa readAsDataURL para texto | Backend debe detectar `data:text/` y decodificar Base64 |
+| Gemini "alucina" contenido | Proxy toString() de LangChain4j | Usar HTTP directo, no proxy |
+
+---
+
+## 8. Detalle Tecnico por Tipo
+
+| Propiedad | Imagen | Audio | PDF | Texto |
+|:---|:---|:---|:---|:---|
+| Prefijo | `data:image/*` | `data:audio/*` | `data:application/pdf` | `data:text/*` o sin prefijo |
+| Campo Gemini | `inlineData` | `inlineData` | `inlineData` | `text` |
+| Codificacion | Base64 | Base64 | Base64 | UTF-8 plano |
+| Frontend | readAsDataURL() | readAsDataURL() | readAsDataURL() | readAsText() o readAsDataURL() |
+| Limite por request | ~20 MB total (todos los adjuntos) | ~20 MB total | ~20 MB / ~1000 pags | ~1M tokens |
+| Modelo minimo | gemini-2.0-flash | gemini-2.0-flash | gemini-2.0-flash | Cualquier Gemini |
