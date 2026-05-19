@@ -1,4 +1,4 @@
-# Informe Técnico: Implementación Multimodal en Agentes IA
+# Informe Técnico: Implementación Multimodal 
 
 **Guía completa para implementar subida y procesamiento de archivos (imágenes, audio, PDFs y texto) en cualquier agente basado en la API de Google Gemini.**
 
@@ -227,15 +227,122 @@ Los delimitadores `--- ARCHIVO: nombre ---` evitan que Gemini confunda el conten
 
 ---
 
+### 2.5 VIDEO (MP4, MOV, WebM, AVI, MKV, FLV)
+
+Los vídeos NO pueden enviarse como `inlineData` porque superan el límite de ~20 MB del request HTTP. Se usa la **Google Files API** como intermediario: el vídeo se sube primero a Google, y luego se referencia por URI.
+
+#### Por qué es diferente
+
+```
+Imagen/Audio/PDF (pequeños):        Video (grande):
+Data URL → inlineData               Data URL → subir a Files API → fileUri → fileData
+       ↓                                           ↓
+  En el mismo request             Request previo de subida
+```
+
+#### Paso 1 — Frontend (igual que el resto)
+```javascript
+reader.readAsDataURL(videoFile);
+// Resultado: "data:video/mp4;base64,AAAAIGZ0eXBpc29t..."
+```
+
+#### Paso 2 — Backend: detectar vídeo y subirlo a Files API
+```java
+else if (content.startsWith("data:video/")) {
+    // 1. Extraer MIME y bytes
+    String mimeType = content.substring(content.indexOf("data:") + 5, content.indexOf(";"));
+    byte[] videoBytes = Base64.getDecoder().decode(
+        content.substring(content.indexOf(",") + 1).replaceAll("\\s", ""));
+
+    // 2. Subir a Google Files API (2 peticiones HTTP)
+    String fileUri = uploadToFilesApi(videoBytes, mimeType, name);
+
+    // 3. Esperar a que Google lo procese (polling)
+    waitForFileActive(fileUri);
+
+    // 4. Construir bloque fileData con la URI devuelta
+    Map<String, Object> fileData = new LinkedHashMap<>();
+    fileData.put("mimeType", mimeType);
+    fileData.put("fileUri", fileUri);
+    userParts.add(Map.of("fileData", fileData));
+}
+```
+
+#### Paso 3 — uploadToFilesApi(): subida resumable en 2 pasos
+```java
+// PETICIÓN 1: Iniciar sesión de subida
+POST https://generativelanguage.googleapis.com/upload/v1beta/files
+Header: x-goog-api-key: <API_KEY>
+Header: X-Goog-Upload-Protocol: resumable
+Header: X-Goog-Upload-Command: start
+Header: X-Goog-Upload-Header-Content-Length: <tamaño en bytes>
+Header: X-Goog-Upload-Header-Content-Type: video/mp4
+Body: { "file": { "displayName": "video.mp4" } }
+
+← Google responde con header: X-Goog-Upload-URL: https://...
+
+// PETICIÓN 2: Enviar los bytes reales
+POST <X-Goog-Upload-URL>
+Header: X-Goog-Upload-Offset: 0
+Header: X-Goog-Upload-Command: upload, finalize
+Body: <bytes del vídeo>
+
+← Google responde: { "file": { "uri": "https://.../files/abc123", "state": "PROCESSING" } }
+```
+
+#### Paso 4 — waitForFileActive(): esperar procesamiento
+```java
+// Polling cada 2 segundos hasta estado ACTIVE (máx 60s)
+GET <fileUri>
+Header: x-goog-api-key: <API_KEY>
+
+← { "state": "PROCESSING" }  → esperar 2s
+← { "state": "ACTIVE" }      → listo para usar
+← { "state": "FAILED" }      → error
+```
+
+#### Paso 5 — JSON final para generateContent
+```json
+{
+  "contents": [{
+    "role": "user",
+    "parts": [
+      {
+        "fileData": {
+          "mimeType": "video/mp4",
+          "fileUri": "https://generativelanguage.googleapis.com/v1beta/files/abc123"
+        }
+      },
+      { "text": "¿Qué ocurre en este vídeo?" }
+    ]
+  }]
+}
+```
+
+#### Paso 6 — Borrado automático inmediato
+
+
+Una vez Gemini responde, se ejecuta un bloque `finally` para enviar una petición `DELETE` a la Files API y liberar espacio inmediatamente, evitando chocar con el límite de 20 GB de Google:
+
+```java
+// PETICIÓN 3: Borrar archivo temporal
+DELETE https://generativelanguage.googleapis.com/v1beta/files/abc123
+Header: x-goog-api-key: <API_KEY>
+```
+
+> Los archivos subidos a Files API se **borran automáticamente a las 48 horas**, pero el Backend fuerza su borrado inmediato tras el análisis para mantener el uso al 0%. La subida es **gratuita** (solo se cobran los tokens de procesamiento de Gemini).
+
+---
+
 ## 3. Tabla de Tipos Soportados
 
-| Tipo | Formatos | MIME types | Campo JSON | Limite inline | Estado |
+| Tipo | Formatos | MIME types | Campo JSON | Límite | Estado |
 |:---|:---|:---|:---|:---|:---|
-| Imagen | JPEG, PNG, WebP, GIF, BMP, TIFF | `image/*` | `inlineData` | ~15 MB por archivo (20 MB total request) | Operativo |
-| Audio | MP3, WAV, OGG, FLAC, AAC, M4A | `audio/*` | `inlineData` | ~15 MB por archivo (20 MB total request) | Operativo |
-| PDF | PDF | `application/pdf` | `inlineData` | ~15 MB / ~1000 paginas | Operativo |
-| Texto | TXT, JS, PY, JSON, XML, CSV, HTML | `text/*` | `text` | ~1M tokens de contexto | Operativo |
-| Video | MP4, MOV, WebM | `video/*` | `fileData` | 2 GB (requiere Files API) | Requiere Files API |
+| Imagen | JPEG, PNG, WebP, GIF, BMP, TIFF | `image/*` | `inlineData` | ~15 MB por archivo (20 MB total request) | ✅ Operativo |
+| Audio | MP3, WAV, OGG, FLAC, AAC, M4A | `audio/*` | `inlineData` | ~15 MB por archivo (20 MB total request) | ✅ Operativo |
+| PDF | PDF | `application/pdf` | `inlineData` | ~15 MB / ~1000 páginas | ✅ Operativo |
+| Texto | TXT, JS, PY, JSON, XML, CSV, HTML | `text/*` | `text` | ~1M tokens de contexto | ✅ Operativo |
+| Vídeo | MP4, MOV, WebM, AVI, MKV, FLV | `video/*` | `fileData` (Files API) | 2 GB / 1 hora (20 GB totales) | ✅ Operativo + Borrado auto |
 
 > **Nota sobre el limite de 20 MB:** Es el limite del request HTTP completo (todos los adjuntos sumados). La codificacion Base64 infla el tamano un ~33%, por lo que un archivo de ~15 MB en disco genera ~20 MB de Base64.
 
@@ -447,9 +554,10 @@ quarkus.http.limits.max-body-size=2000M
 
 ### Paso 2: Logica del Clasificador
 ```java
-if (content.startsWith("data:image/"))             → buildInlineData()
-else if (content.startsWith("data:audio/"))         → buildInlineData()
-else if (content.startsWith("data:application/pdf"))→ buildInlineData()
+if (content.startsWith("data:image/"))             → buildInlineData()      // inlineData
+else if (content.startsWith("data:audio/"))         → buildInlineData()      // inlineData
+else if (content.startsWith("data:application/pdf"))→ buildInlineData()      // inlineData
+else if (content.startsWith("data:video/"))         → uploadToFilesApi()     // fileData (Files API)
 else if (content.startsWith("data:text/"))          → decodificar Base64 → text
 else if (!content.startsWith("data:"))              → text plano directo
 ```
@@ -500,16 +608,22 @@ Response → candidates[0].content.parts[].text (buscar primera part con texto)
 | content es null | finishReason SAFETY o RECITATION | Leer `finishReason` del candidate |
 | Archivos texto descartados | Frontend usa readAsDataURL para texto | Backend debe detectar `data:text/` y decodificar Base64 |
 | Gemini "alucina" contenido | Proxy toString() de LangChain4j | Usar HTTP directo, no proxy |
+| X-Goog-Upload-URL no recibida | Files API no devolvio header de subida | Verificar API Key y que el endpoint de upload es correcto |
+| state FAILED en polling | Google no pudo procesar el video | Verificar formato del video; probar con MP4 H.264 |
+| Timeout en waitForFileActive | Video muy largo o red lenta | Aumentar el limite de iteraciones (actualmente 30 x 2s = 60s) |
 
 ---
 
 ## 8. Detalle Tecnico por Tipo
 
-| Propiedad | Imagen | Audio | PDF | Texto |
-|:---|:---|:---|:---|:---|
-| Prefijo | `data:image/*` | `data:audio/*` | `data:application/pdf` | `data:text/*` o sin prefijo |
-| Campo Gemini | `inlineData` | `inlineData` | `inlineData` | `text` |
-| Codificacion | Base64 | Base64 | Base64 | UTF-8 plano |
-| Frontend | readAsDataURL() | readAsDataURL() | readAsDataURL() | readAsText() o readAsDataURL() |
-| Limite por request | ~20 MB total (todos los adjuntos) | ~20 MB total | ~20 MB / ~1000 pags | ~1M tokens |
-| Modelo minimo | gemini-2.0-flash | gemini-2.0-flash | gemini-2.0-flash | Cualquier Gemini |
+| Propiedad | Imagen | Audio | PDF | Texto | Video |
+|:---|:---|:---|:---|:---|:---|
+| Prefijo | `data:image/*` | `data:audio/*` | `data:application/pdf` | `data:text/*` o sin prefijo | `data:video/*` |
+| Campo Gemini | `inlineData` | `inlineData` | `inlineData` | `text` | `fileData` |
+| Metodo | Inline en request | Inline en request | Inline en request | Inline en request | Files API (2 requests previos) |
+| Codificacion | Base64 | Base64 | Base64 | UTF-8 plano | Base64 → bytes |
+| Frontend | readAsDataURL() | readAsDataURL() | readAsDataURL() | readAsText() o readAsDataURL() | readAsDataURL() |
+| Limite | ~20 MB total request | ~20 MB total request | ~20 MB / ~1000 pags | ~1M tokens | 2 GB / 1 hora |
+| Coste extra | No | No | No | No | No (Files API gratuita) |
+| Expiracion | N/A | N/A | N/A | N/A | 48 horas |
+| Modelo minimo | gemini-2.0-flash | gemini-2.0-flash | gemini-2.0-flash | Cualquier Gemini | gemini-2.0-flash |
